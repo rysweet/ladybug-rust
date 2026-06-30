@@ -52,6 +52,15 @@ jobs:
         with:
           fetch-depth: 1
 
+      # The prebuilt liblbug archive bundles the extension installer, whose
+      # embedded httplib SSLClient links against the system OpenSSL. Install
+      # the development package explicitly so the linker can always resolve
+      # libssl/libcrypto regardless of the base runner image.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
       - name: Checkout ladybug
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
