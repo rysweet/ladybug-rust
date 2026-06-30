@@ -15,7 +15,7 @@ fn get_target() -> String {
     env::var("PROFILE").unwrap()
 }
 
-fn link_libraries(link_bundled_deps: bool) {
+fn link_libraries(link_bundled_deps: bool, link_openssl: bool) {
     // This also needs to be set by any crates using it if they want to use extensions
     if !cfg!(windows) && link_mode() == "static" {
         println!("cargo:rustc-link-arg=-rdynamic");
@@ -38,6 +38,19 @@ fn link_libraries(link_bundled_deps: bool) {
             println!("cargo:rustc-link-lib=dylib=c++");
         } else {
             println!("cargo:rustc-link-lib=dylib=stdc++");
+            if link_openssl {
+                // Some prebuilt liblbug archives bundle the extension installer,
+                // whose embedded httplib SSLClient references the system OpenSSL
+                // (libssl/libcrypto). These are emitted after the whole-archive
+                // liblbug link above so the linker can resolve the SSL_*/X509_*/
+                // ASN1_* symbols; without them the final test and example
+                // binaries fail at link time with "undefined symbol: SSL_CTX_new"
+                // etc. Linking is gated on `link_openssl` so archives that do not
+                // reference OpenSSL (e.g. the default release/compat archive) keep
+                // building on hosts without libssl available.
+                println!("cargo:rustc-link-lib=dylib=ssl");
+                println!("cargo:rustc-link-lib=dylib=crypto");
+            }
         }
 
         if !link_bundled_deps {
@@ -74,6 +87,24 @@ fn link_libraries(link_bundled_deps: bool) {
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+}
+
+/// Detects whether the resolved static liblbug archive references the system
+/// OpenSSL. Newer prebuilt archives bundle the extension installer, whose
+/// embedded httplib `SSLClient` pulls in libssl/libcrypto, while the default
+/// release/compat archive uses a different TLS backend and references no OpenSSL
+/// symbols at all. We scan the archive bytes for a representative symbol so the
+/// libssl/libcrypto link dependency is only added when it is actually required.
+fn static_archive_needs_openssl(search_dirs: &[PathBuf]) -> bool {
+    const MARKER: &[u8] = b"SSL_CTX_new";
+    let file_name = static_lbug_file_name();
+    for dir in search_dirs {
+        let candidate = dir.join(file_name);
+        if let Ok(bytes) = std::fs::read(&candidate) {
+            return bytes.windows(MARKER.len()).any(|window| window == MARKER);
+        }
+    }
+    false
 }
 
 fn static_lbug_file_name() -> &'static str {
@@ -365,6 +396,7 @@ fn main() {
     let mut bundled = false;
     let link_bundled_deps = false;
     let mut include_paths = vec![manifest_dir.join("include")];
+    let mut lbug_lib_dirs: Vec<PathBuf> = Vec::new();
 
     if let (Ok(lbug_lib_dir), Ok(lbug_include)) =
         (env::var("LBUG_LIBRARY_DIR"), env::var("LBUG_INCLUDE_DIR"))
@@ -372,17 +404,23 @@ fn main() {
         println!("cargo:rustc-link-search=native={lbug_lib_dir}");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{lbug_lib_dir}");
         emit_lbug_metadata("external", Path::new(&lbug_lib_dir));
+        lbug_lib_dirs.push(PathBuf::from(&lbug_lib_dir));
         include_paths.push(Path::new(&lbug_include).to_path_buf());
     } else if let Some(prebuilt_include_paths) = use_prebuilt_lbug(&manifest_dir) {
+        lbug_lib_dirs.push(prebuilt_lib_dir(&manifest_dir));
         include_paths.extend(prebuilt_include_paths);
     } else {
-        include_paths.extend(build_bundled_cmake());
+        let bundled_paths = build_bundled_cmake();
+        lbug_lib_dirs.extend(bundled_paths.iter().cloned());
+        include_paths.extend(bundled_paths);
         bundled = true;
         println!("cargo:rustc-env=LBUG_PRECOMPILED_SOURCE=source");
         println!("cargo:rustc-env=LBUG_PRECOMPILED_LIBRARY_DIR=");
     }
+    let link_openssl =
+        link_mode() == "static" && static_archive_needs_openssl(&lbug_lib_dirs);
     if link_mode() == "static" {
-        link_libraries(link_bundled_deps);
+        link_libraries(link_bundled_deps, link_openssl);
     }
     build_ffi(
         "src/ffi.rs",
@@ -402,6 +440,6 @@ fn main() {
         );
     }
     if link_mode() == "dylib" {
-        link_libraries(link_bundled_deps);
+        link_libraries(link_bundled_deps, link_openssl);
     }
 }
